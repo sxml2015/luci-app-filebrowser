@@ -1,0 +1,6 @@
+#!/bin/sh
+# Clear LuCI caches so the new menu entry shows up, and reload rpcd so the
+# luci.filebrowser ucode plugin is registered.
+rm -rf /tmp/luci-indexcache /tmp/luci-modulecache /tmp/luci-stat 2>/dev/null
+[ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd restart >/dev/null 2>&1
+exit 0

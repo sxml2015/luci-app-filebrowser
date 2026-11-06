@@ -1,0 +1,283 @@
+#!/usr/bin/env ucode
+//
+// luci.filebrowser - rpcd backend for luci-app-filebrowser (25.12 port)
+//
+// Ported from DarkDean89/luci-app-filebrowser (Lua controller).
+// Differences to the original:
+//  - No shell commands anywhere: all operations use the ucode "fs" module,
+//    so file names can no longer inject shell commands (the original built
+//    `rm -r "..."`, `mv "..." "..."` and `ls -lh "..."` strings by hand).
+//  - Directory listings are structured data (lsdir + stat), not `ls -lh`
+//    output parsed by regex in the browser, so names with spaces work.
+//  - Recursive delete is implemented natively and refuses to remove "/".
+//  - Downloads/uploads go through base64 RPC payloads with a size cap
+//    instead of the Lua ltn12 pump / multipart file handler.
+//
+// Copyright of the original Lua application: giaulo / DarkDean89.
+// This port is licensed under GPL-2.0.
+
+'use strict';
+
+import { access, basename, dirname, lsdir, mkdir, readfile, readlink, rename, rmdir, stat, unlink, writefile } from 'fs';
+
+/* b64enc()/b64dec() are ucode core builtins, no import required. */
+
+const MAX_TRANSFER = 32 * 1024 * 1024; /* 32 MiB cap for read/write RPC payloads */
+
+const MIME_TYPES = {
+	txt: 'text/plain', conf: 'text/plain', ovpn: 'text/plain', log: 'text/plain',
+	js: 'text/javascript', json: 'application/json', css: 'text/css',
+	htm: 'text/html', html: 'text/html', patch: 'text/x-patch',
+	c: 'text/x-csrc', h: 'text/x-chdr',
+	bmp: 'image/bmp', gif: 'image/gif', png: 'image/png',
+	jpg: 'image/jpeg', jpeg: 'image/jpeg', svg: 'image/svg+xml',
+	zip: 'application/zip', pdf: 'application/pdf', xml: 'application/xml',
+	gz: 'application/gzip', tgz: 'application/gzip', bz2: 'application/x-bzip2',
+	xz: 'application/x-xz', ipk: 'application/octet-stream',
+	apk: 'application/octet-stream', iso: 'application/x-cd-image',
+	mp3: 'audio/mpeg', ogg: 'audio/x-vorbis', wav: 'audio/wav',
+	mp4: 'video/mp4', mpg: 'video/mpeg', mpeg: 'video/mpeg', avi: 'video/x-msvideo',
+	sh: 'application/x-shellscript'
+};
+
+function to_mime(name) {
+	let ext = match(name, /\.([^.]+)$/)?.[1];
+	return MIME_TYPES[lc(ext ?? '')] ?? 'application/octet-stream';
+}
+
+/* Lexically normalise an absolute path: resolves "." and ".." without
+ * touching the filesystem, rejects relative paths and NUL bytes. */
+function normalize(path) {
+	if (type(path) != 'string' || path == '' || substr(path, 0, 1) != '/')
+		return null;
+	if (index(path, '\0') >= 0)
+		return null;
+
+	let out = [];
+	for (let part in split(path, '/')) {
+		if (part == '' || part == '.')
+			continue;
+		if (part == '..')
+			pop(out);
+		else
+			push(out, part);
+	}
+	return '/' + join('/', out);
+}
+
+function joinpath(dir, name) {
+	return (dir == '/') ? '/' + name : dir + '/' + name;
+}
+
+function entry_info(dir, name) {
+	let path = joinpath(dir, name);
+	let link = readlink(path);
+	let st = stat(path);            /* follows symlinks; null for broken links */
+
+	let type_name, size = 0, mtime = 0, mode = null;
+
+	if (link != null) {
+		type_name = 'link';
+		if (st) {
+			size = st.size;
+			mtime = st.mtime;
+			mode = st.mode;
+		}
+	}
+	else if (st) {
+		type_name = st.type;        /* 'file', 'directory', 'char', ... */
+		size = st.size;
+		mtime = st.mtime;
+		mode = st.mode;
+	}
+	else {
+		return null;
+	}
+
+	let info = {
+		name: name,
+		type: (type_name == 'directory') ? 'dir' : (type_name == 'link' ? 'link' : 'file'),
+		size: size,
+		mtime: mtime,
+		mode: mode
+	};
+
+	if (type_name == 'link') {
+		info.link_target = link;
+		let abs = (substr(link, 0, 1) == '/') ? normalize(link) : normalize(joinpath(dir, link));
+		info.link_abspath = abs;
+		let tst = abs ? stat(abs) : null;
+		info.link_type = tst ? (tst.type == 'directory' ? 'dir' : 'file') : 'broken';
+	}
+
+	return info;
+}
+
+function list_dir(req) {
+	let path = normalize(req.args?.path ?? '/');
+	if (path == null)
+		return { error: 'Invalid path' };
+
+	let st = stat(path);
+	if (!st)
+		return { error: 'No such file or directory: ' + path };
+	if (st.type != 'directory')
+		return { error: 'Not a directory: ' + path };
+
+	let names = lsdir(path);
+	if (names == null)
+		return { error: 'Cannot read directory: ' + path };
+
+	let entries = [];
+	for (let name in names) {
+		let info = entry_info(path, name);
+		if (info)
+			push(entries, info);
+	}
+
+	/* Directories and dir-links first, then files, alphabetical within groups */
+	sort(entries, function(a, b) {
+		let ga = (a.type == 'dir' || (a.type == 'link' && a.link_type == 'dir')) ? 0 : 1;
+		let gb = (b.type == 'dir' || (b.type == 'link' && b.link_type == 'dir')) ? 0 : 1;
+		if (ga != gb) return ga - gb;
+		return (a.name < b.name) ? -1 : (a.name > b.name) ? 1 : 0;
+	});
+
+	return {
+		path: path,
+		parent: (path == '/') ? null : (dirname(path) || '/'),
+		entries: entries
+	};
+}
+
+function remove_recursive(path) {
+	/* Symlinks are removed as links, never followed */
+	if (readlink(path) != null)
+		return unlink(path);
+
+	let st = stat(path);
+	if (!st)
+		return false;
+
+	if (st.type == 'directory') {
+		let ok = true;
+		for (let name in (lsdir(path) ?? []))
+			ok = remove_recursive(joinpath(path, name)) && ok;
+		return rmdir(path) && ok;
+	}
+
+	return unlink(path);
+}
+
+function do_remove(req) {
+	let path = normalize(req.args?.path ?? '');
+	if (path == null)
+		return { error: 'Invalid path' };
+	if (path == '/')
+		return { error: 'Refusing to delete the root directory' };
+	if (!remove_recursive(path))
+		return { error: 'Failed to delete: ' + path };
+	return { result: true, path: dirname(path) || '/' };
+}
+
+function do_rename(req) {
+	let src = normalize(req.args?.path ?? '');
+	let dst = normalize(req.args?.newpath ?? '');
+	if (src == null || dst == null)
+		return { error: 'Invalid path' };
+	if (src == '/')
+		return { error: 'Refusing to rename the root directory' };
+	if (access(dst))
+		return { error: 'Target already exists: ' + dst };
+	if (!rename(src, dst))
+		return { error: 'Failed to rename: ' + src };
+	return { result: true, path: dirname(src) || '/' };
+}
+
+function do_mkdir(req) {
+	let path = normalize(req.args?.path ?? '');
+	if (path == null || path == '/')
+		return { error: 'Invalid path' };
+	if (access(path))
+		return { error: 'Already exists: ' + path };
+	if (!mkdir(path))
+		return { error: 'Failed to create directory: ' + path };
+	return { result: true, path: dirname(path) || '/' };
+}
+
+function do_read(req) {
+	let path = normalize(req.args?.path ?? '');
+	if (path == null)
+		return { error: 'Invalid path' };
+
+	let st = stat(path);
+	if (!st || st.type == 'directory')
+		return { error: 'No such file: ' + path };
+	if (st.size > MAX_TRANSFER)
+		return { error: 'File is larger than the 32 MiB transfer limit' };
+
+	let data = readfile(path);
+	if (data == null)
+		return { error: 'Cannot read file: ' + path };
+
+	return {
+		name: basename(path),
+		size: length(data),
+		mime: to_mime(path),
+		data: b64enc(data)
+	};
+}
+
+function do_write(req) {
+	let path = normalize(req.args?.path ?? '');
+	if (path == null || path == '/')
+		return { error: 'Invalid path' };
+
+	let st = stat(path);
+	if (st && st.type == 'directory')
+		return { error: 'Is a directory: ' + path };
+
+	let raw = req.args?.data;
+	if (type(raw) != 'string')
+		return { error: 'Missing upload data' };
+
+	let data = b64dec(raw);
+	if (data == null)
+		return { error: 'Invalid base64 payload' };
+	if (length(data) > MAX_TRANSFER)
+		return { error: 'File is larger than the 32 MiB transfer limit' };
+
+	if (!writefile(path, data))
+		return { error: 'Cannot write file: ' + path };
+
+	return { result: true, path: dirname(path) || '/', size: length(data) };
+}
+
+const methods = {
+	list: {
+		args: { path: 'path' },
+		call: list_dir
+	},
+	remove: {
+		args: { path: 'path' },
+		call: do_remove
+	},
+	rename: {
+		args: { path: 'path', newpath: 'newpath' },
+		call: do_rename
+	},
+	mkdir: {
+		args: { path: 'path' },
+		call: do_mkdir
+	},
+	read: {
+		args: { path: 'path' },
+		call: do_read
+	},
+	write: {
+		args: { path: 'path', data: 'data' },
+		call: do_write
+	}
+};
+
+return { 'luci.filebrowser': methods };

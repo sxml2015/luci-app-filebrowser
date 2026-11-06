@@ -1,0 +1,65 @@
+# Simplified Chinese translations for luci-app-filebrowser (25.12 port).
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Language: zh_Hans\n"
+
+msgid "Document Management"
+msgstr "文件管理"
+
+msgid "Request failed"
+msgstr "请求失败"
+
+msgid "Loading…"
+msgstr "加载中…"
+
+msgid "Name"
+msgstr "名称"
+
+msgid "Modified"
+msgstr "修改时间"
+
+msgid "Size"
+msgstr "大小"
+
+msgid "Permissions"
+msgstr "权限"
+
+msgid "Actions"
+msgstr "操作"
+
+msgid "Rename"
+msgstr "重命名"
+
+msgid "Delete"
+msgstr "删除"
+
+msgid "Confirm deletion of %s ?"
+msgstr "确认删除 %s 吗？"
+
+msgid "Enter a new name:"
+msgstr "输入新名称："
+
+msgid "Name must not contain /"
+msgstr "名称不能包含 /"
+
+msgid "Broken symbolic link"
+msgstr "符号链接已失效"
+
+msgid "Failed to read local file"
+msgstr "读取本地文件失败"
+
+msgid "Go"
+msgstr "转到"
+
+msgid "Refresh"
+msgstr "刷新"
+
+msgid "Upload"
+msgstr "上传"
+
+msgid "New Folder"
+msgstr "新建文件夹"
+
+msgid "Enter folder name:"
+msgstr "输入文件夹名称："

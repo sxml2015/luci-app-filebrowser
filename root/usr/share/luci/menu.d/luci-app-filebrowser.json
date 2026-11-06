@@ -1,0 +1,1 @@
+{"admin/system/filebrowser":{"action":{"path":"system/filebrowser","type":"view"},"depends":{"acl":["luci-app-filebrowser"]},"order":60,"title":"Document Management"}}
